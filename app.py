@@ -1,637 +1,142 @@
 import streamlit as st
 import tensorflow as tf
-from tensorflow.keras.applications.resnet50 import preprocess_input as resnet50_preprocess
-from PIL import Image, ImageEnhance
+from PIL import Image
 import numpy as np
-import time
+import io
+import os # For listing models
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Coffee Bean Quality Classifier",
-    page_icon="☕",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- Configuration ---
+MODEL_DIR = "models"
+# Define the expected input size for your models (assuming they are consistent)
+# You might need to adjust these based on what your specific models were trained with.
+TARGET_SIZE = (224, 224) # Common size for many vision models
 
-# --- Custom CSS for Better UI ---
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        text-align: center;
-        color: #8B4513;
-        margin-bottom: 0.5rem;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-    }
-    .sub-header {
-        text-align: center;
-        color: #5D4037;
-        font-size: 1.2rem;
-        margin-bottom: 2rem;
-    }
-    .prediction-good {
-        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-        border: 2px solid #28a745;
-        padding: 1rem;
-        border-radius: 10px;
-        text-align: center;
-        font-weight: bold;
-        color: #155724;
-    }
-    .prediction-bad {
-        background: linear-gradient(135deg, #f8d7da 0%, #f1b0b7 100%);
-        border: 2px solid #dc3545;
-        padding: 1rem;
-        border-radius: 10px;
-        text-align: center;
-        font-weight: bold;
-        color: #721c24;
-    }
-    .prediction-uncertain {
-        background: linear-gradient(135deg, #fff3cd 0%, #fce4ec 100%);
-        border: 2px solid #ffc107;
-        padding: 1rem;
-        border-radius: 10px;
-        text-align: center;
-        font-weight: bold;
-        color: #856404;
-    }
-    .confidence-metric {
-        background: #f8f9fa;
-        padding: 0.5rem 1rem;
-        border-radius: 8px;
-        margin: 0.25rem 0;
-        border-left: 4px solid #007bff;
-    }
-    .metric-good {
-        border-left-color: #28a745;
-    }
-    .metric-bad {
-        border-left-color: #dc3545;
-    }
-    .best-model-card {
-        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
-        border: 2px solid #2196f3;
-        padding: 1.5rem;
-        border-radius: 15px;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        margin-bottom: 1rem;
-    }
-    .tab-content {
-        padding: 2rem 0;
-    }
-    .feature-highlight {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 8px;
-        border-left: 4px solid #007bff;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Define the ripeness labels based on your model's output
+# This is a placeholder; replace with your actual class names
+RIPENESS_LABELS = ["Unripe", "Ripe", "Overripe"]
+# You might have more specific labels or fewer, depending on your model.
+# Example: If your model outputs 0 for unripe, 1 for ripe, 2 for overripe.
 
+# --- Helper Functions ---
+@st.cache_resource # Cache the model loading to avoid reloading on every rerun
+def load_keras_model(model_path):
+    """Loads a Keras model from a .keras file."""
+    try:
+        model = tf.keras.models.load_model(model_path)
+        return model
+    except Exception as e:
+        st.error(f"Error loading Keras model {model_path}: {e}")
+        return None
 
-# -----------------------------
-# Sidebar controls (UI options)
-# -----------------------------
-def create_sidebar():
-    st.sidebar.header("🛠️ Settings")
-    enhance_contrast = st.sidebar.checkbox("Enhance image contrast", value=False)
-    confidence_threshold_high = st.sidebar.slider("High certainty threshold (%)", 60, 95, 75)
-    show_raw_data = st.sidebar.checkbox("Show raw model outputs", value=False)
+@st.cache_resource # Cache the model loading
+def load_tflite_model(model_path):
+    """Loads a TFLite model and allocates tensors."""
+    try:
+        interpreter = tf.lite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        return interpreter
+    except Exception as e:
+        st.error(f"Error loading TFLite model {model_path}: {e}")
+        return None
 
-    softmax_label_order = st.sidebar.radio(
-        "Softmax label order (choose based on how you set class_indices at training)",
-        options=["bad, good (0=bad,1=good)", "good, bad (0=good,1=bad)"],
-        index=0
-    )
-    sigmoid_positive_is_good = st.sidebar.checkbox("If model outputs sigmoid, treat value as probability of GOOD", value=True)
-
-    transfer_preprocess_mode = st.sidebar.selectbox(
-        "Transfer-model preprocessing mode (try different if predictions look wrong)",
-        options=["resnet50", "tf", "simple", "auto"],
-        index=0
-    )
-    run_preprocess_diagnostics = st.sidebar.checkbox("Run transfer-model preprocess diagnostics", value=False)
-
-    # NEW: manual flip toggle for transfer model outputs
-    flip_transfer_manual = st.sidebar.checkbox("Flip Transfer Model Output (manual)", value=False)
-
-    return {
-        "enhance_contrast": enhance_contrast,
-        "confidence_threshold_high": confidence_threshold_high,
-        "show_raw_data": show_raw_data,
-        "softmax_label_order": softmax_label_order,
-        "sigmoid_positive_is_good": sigmoid_positive_is_good,
-        "transfer_preprocess_mode": transfer_preprocess_mode,
-        "run_preprocess_diagnostics": run_preprocess_diagnostics,
-        "flip_transfer_manual": flip_transfer_manual
-    }
-
-
-# initialize session state for auto-detect flip
-if "flip_transfer" not in st.session_state:
-    st.session_state["flip_transfer"] = False
-
-
-# -----------------------------
-# Model loader
-# -----------------------------
-@st.cache_resource
-def load_models():
-    models = {}
-    model_files = {
-        "Custom CNN": "custom_model.h5",
-        "Transfer Learning": "CoffeeBeanbest_model.h5"
-    }
-    for name, fname in model_files.items():
-        try:
-            models[name] = tf.keras.models.load_model(fname)
-            st.sidebar.success(f"✅ {name} loaded")
-        except Exception as e:
-            models[name] = None
-            st.sidebar.error(f"⚠️ Failed to load {name}: {e}")
-    return models
-
-
-# -----------------------------
-# Preprocessing helper
-# -----------------------------
-def preprocess_image(image: Image.Image, target_size=(224, 224), enhance_contrast=False, model_name="Custom CNN", mode="auto"):
+def preprocess_image(image, target_size):
+    """Preprocesses an image for model inference."""
+    # Ensure image is RGB
     if image.mode != "RGB":
         image = image.convert("RGB")
-    if enhance_contrast:
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.2)
 
-    image_resized = image.resize(target_size, Image.Resampling.LANCZOS)
-    arr = np.asarray(image_resized, dtype=np.float32)
-    arr = np.expand_dims(arr, axis=0)  # batch dim
+    image = image.resize(target_size)
+    image_array = np.asarray(image)
+    image_array = image_array / 255.0 # Normalize pixel values to [0, 1]
+    image_array = np.expand_dims(image_array, axis=0) # Add batch dimension
+    return image_array.astype(np.float32) # TFLite often expects float32
 
-    if mode == "auto":
-        mode = "resnet50" if model_name == "Transfer Learning" else "simple"
+def predict_with_keras(model, processed_image):
+    """Makes a prediction using a Keras model."""
+    predictions = model.predict(processed_image)
+    return predictions[0] # Get the first (and only) sample's predictions
 
-    if mode == "resnet50":
-        return resnet50_preprocess(arr.copy())
-    elif mode == "tf":
-        return (arr / 127.5) - 1.0
-    elif mode == "simple":
-        return arr / 255.0
-    else:
-        raise ValueError("Unknown preprocess mode")
+def predict_with_tflite(interpreter, processed_image):
+    """Makes a prediction using a TFLite interpreter."""
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
+    interpreter.set_tensor(input_details[0]['index'], processed_image)
+    interpreter.invoke()
+    predictions = interpreter.get_tensor(output_details[0]['index'])
+    return predictions[0] # Get the first (and only) sample's predictions
 
-# -----------------------------
-# Prediction helper
-# -----------------------------
-def make_enhanced_prediction(model, processed_image, softmax_order, sigmoid_positive_good, high_thresh_pct):
-    try:
-        raw = model.predict(processed_image, verbose=0)[0]
-    except Exception as e:
-        return {"error": f"Prediction failed: {e}"}
+# --- Streamlit App Layout ---
+st.set_page_config(page_title="Ripeness Detector", layout="centered")
 
-    raw = np.asarray(raw).flatten()
+st.title("🌱 Fruit/Vegetable Ripeness Detector")
+st.markdown("""
+Upload an image of a fruit or vegetable, and our models will try to predict its ripeness!
+""")
 
-    if raw.size == 1:
-        if sigmoid_positive_good:
-            confidence_good = float(raw[0]) * 100.0
-            confidence_bad = 100.0 - confidence_good
-        else:
-            confidence_bad = float(raw[0]) * 100.0
-            confidence_good = 100.0 - confidence_bad
-    else:
-        if softmax_order == "bad_good":
-            confidence_bad = float(raw[0]) * 100.0
-            confidence_good = float(raw[1]) * 100.0
-        else:
-            confidence_good = float(raw[0]) * 100.0
-            confidence_bad = float(raw[1]) * 100.0
+# --- Model Selection ---
+st.sidebar.header("Model Selection")
 
-    medium_thresh = max(50, high_thresh_pct - 15)
+# Get a list of available models
+available_models = [f for f in os.listdir(MODEL_DIR) if f.endswith(('.keras', '.tflite'))]
+if not available_models:
+    st.error(f"No models found in the '{MODEL_DIR}' directory. Please check your setup.")
+    st.stop()
 
-    if confidence_good >= confidence_bad:
-        chosen_label = "Good Bean"
-        chosen_conf = confidence_good
-    else:
-        chosen_label = "Bad Bean"
-        chosen_conf = confidence_bad
+selected_model_name = st.sidebar.selectbox(
+    "Choose a model:",
+    available_models
+)
 
-    if chosen_conf >= high_thresh_pct:
-        certainty = "High"
-    elif chosen_conf >= medium_thresh:
-        certainty = "Medium"
-    else:
-        certainty = "Low"
-        chosen_label = "Uncertain"
+selected_model_path = os.path.join(MODEL_DIR, selected_model_name)
+model = None
 
-    return {
-        "prediction": chosen_label,
-        "confidence_good": confidence_good,
-        "confidence_bad": confidence_bad,
-        "certainty": certainty,
-        "raw_output": raw.tolist()
-    }
+if selected_model_name.endswith('.keras'):
+    model = load_keras_model(selected_model_path)
+elif selected_model_name.endswith('.tflite'):
+    model = load_tflite_model(selected_model_path)
+
+if model is None:
+    st.warning("Please select a valid model from the sidebar to proceed.")
+    st.stop()
 
 
-# -----------------------------
-# Utility to flip a model result (swap confidences & label)
-# -----------------------------
-def maybe_flip_result(result):
-    if not result or "raw_output" not in result:
-        return result
-    r = result.copy()
-    # swap numerical confidences
-    r["confidence_good"], r["confidence_bad"] = result["confidence_bad"], result["confidence_good"]
-    # swap label
-    if result["prediction"] == "Good Bean":
-        r["prediction"] = "Bad Bean"
-    elif result["prediction"] == "Bad Bean":
-        r["prediction"] = "Good Bean"
-    return r
+# --- Image Upload ---
+uploaded_file = st.file_uploader(
+    "Upload an image here",
+    type=["jpg", "jpeg", "png"],
+    help="Drag and drop your image file or click to browse."
+)
 
+if uploaded_file is not None:
+    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+    st.write("")
+    st.write("Detecting ripeness...")
 
-# -----------------------------
-# Confidence display helper
-# -----------------------------
-def display_confidence_metrics(result, model_name):
-    st.markdown(f"**📊 {model_name} Confidence:**")
-    st.markdown(f"<div class='confidence-metric metric-good'>🟢 Good Bean: <strong>{result['confidence_good']:.1f}%</strong></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='confidence-metric metric-bad'>🔴 Bad Bean: <strong>{result['confidence_bad']:.1f}%</strong></div>", unsafe_allow_html=True)
-    st.progress(min(max(result['confidence_good'] / 100.0, 0.0), 1.0))
-    st.progress(min(max(result['confidence_bad'] / 100.0, 0.0), 1.0))
-
-
-# -----------------------------
-# Image upload component (reusable)
-# -----------------------------
-def image_upload_section(key_suffix=""):
-    col_upload, col_info = st.columns([2, 1])
-    
-    with col_upload:
-        uploaded_file = st.file_uploader(
-            "📸 Upload your coffee bean image", 
-            type=["jpg", "jpeg", "png", "bmp", "tiff"], 
-            key=f"image_upload_{key_suffix}"
-        )
-    
-    with col_info:
-        with st.expander("ℹ️ How to get best results"):
-            st.write("""
-            **For optimal predictions:**
-            - Use clear, well-lit images
-            - Ensure beans are clearly visible
-            - Avoid blurry or dark images
-            - Single bean or small groups work best
-            - Try contrast enhancement for low-light images
-            """)
-    
-    return uploaded_file
-
-
-# -----------------------------
-# Best Model Tab Content
-# -----------------------------
-def best_model_tab(settings, models):
-    st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-    
-    # Best Model Header
-    st.markdown("""
-    <div class="best-model-card">
-        <h2 style="color: #1976d2; margin: 0; text-align: center;">
-            🏆 Best Model: Transfer Learning
-        </h2>
-        <p style="text-align: center; margin: 0.5rem 0; color: #424242;">
-            Our most accurate model trained on a large dataset with transfer learning
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Features highlight
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("""
-        <div class="feature-highlight">
-            <h4>🎯 High Accuracy</h4>
-            <p>Leverages pre-trained ResNet50 for superior performance</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="feature-highlight">
-            <h4>⚡ Fast Processing</h4>
-            <p>Optimized for quick and reliable predictions</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown("""
-        <div class="feature-highlight">
-            <h4>🔬 Advanced Analysis</h4>
-            <p>Detailed confidence metrics and diagnostics</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    uploaded_file = image_upload_section("best_model")
-    
-    if not uploaded_file:
-        st.info("👆 Upload a coffee bean image to start the analysis with our best model")
-        return
-    
-    # Process image
+    # Load and preprocess the image
     image = Image.open(uploaded_file)
-    
-    # Display image
-    st.subheader("📷 Image Analysis")
-    col_img, col_details = st.columns([2, 1])
-    
-    with col_img:
-        st.image(image, caption="Uploaded Image", use_column_width=True)
-    
-    with col_details:
-        st.write("**Image Details:**")
-        st.write(f"- Size: {image.size[0]} × {image.size[1]} pixels")
-        st.write(f"- Mode: {image.mode}")
-        st.write(f"- Format: {image.format}")
-        
-        if settings["enhance_contrast"]:
-            enhanced = ImageEnhance.Contrast(image).enhance(1.2)
-            st.image(enhanced, caption="Enhanced Image", use_column_width=True)
-    
-    # Model prediction
-    if models.get("Transfer Learning") is None:
-        st.error("❌ Transfer Learning model not available")
-        return
-    
-    st.subheader("🤖 Prediction Results")
-    
-    model = models["Transfer Learning"]
-    
-    # Preprocessing diagnostics if enabled
-    if settings["run_preprocess_diagnostics"]:
-        st.info("Running preprocess diagnostics for Transfer model...")
-        modes = ["resnet50", "tf", "simple"]
-        diag = {}
-        for mode in modes:
-            try:
-                proc = preprocess_image(image, enhance_contrast=settings["enhance_contrast"], model_name="Transfer Learning", mode=mode)
-                raw = model.predict(proc, verbose=0)[0]
-                diag[mode] = np.asarray(raw).tolist()
-            except Exception as e:
-                diag[mode] = f"error: {e}"
-        with st.expander("🔬 Preprocess diagnostics (raw outputs for each mode)"):
-            st.write(diag)
-    
+    processed_image = preprocess_image(image, TARGET_SIZE)
+
     # Make prediction
-    try:
-        processed = preprocess_image(
-            image, 
-            enhance_contrast=settings["enhance_contrast"], 
-            model_name="Transfer Learning", 
-            mode=settings["transfer_preprocess_mode"]
-        )
-    except Exception as e:
-        st.error(f"Preprocessing failed: {e}")
-        return
-    
-    with st.spinner("🔄 Analyzing with Transfer Learning model..."):
-        time.sleep(0.3)
-        soft_order_str = "bad_good" if settings["softmax_label_order"].startswith("bad") else "good_bad"
-        
-        result = make_enhanced_prediction(
-            model,
-            processed,
-            softmax_order=soft_order_str,
-            sigmoid_positive_good=settings["sigmoid_positive_is_good"],
-            high_thresh_pct=settings["confidence_threshold_high"]
-        )
-        
-        if "error" in result:
-            st.error(result["error"])
-            return
-        
-        # Apply flip if needed
-        flip_transfer_effective = st.session_state.get("flip_transfer", False) or settings["flip_transfer_manual"]
-        if flip_transfer_effective:
-            result = maybe_flip_result(result)
-        
-        # Display prediction
-        col_pred, col_conf = st.columns([1, 1])
-        
-        with col_pred:
-            if result['prediction'] == "Good Bean":
-                st.markdown(f'<div class="prediction-good">🟢 {result["prediction"]}<br>Confidence: {result["confidence_good"]:.1f}%<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-            elif result['prediction'] == "Bad Bean":
-                st.markdown(f'<div class="prediction-bad">🔴 {result["prediction"]}<br>Confidence: {result["confidence_bad"]:.1f}%<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="prediction-uncertain">🟡 {result["prediction"]}<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-        
-        with col_conf:
-            display_confidence_metrics(result, "Transfer Learning")
-        
-        if settings["show_raw_data"]:
-            with st.expander("🔧 Raw Model Output"):
-                st.write(result['raw_output'])
-    
-    st.markdown('</div>', unsafe_allow_html=True)
+    predictions = None
+    if selected_model_name.endswith('.keras'):
+        predictions = predict_with_keras(model, processed_image)
+    elif selected_model_name.endswith('.tflite'):
+        predictions = predict_with_tflite(model, processed_image)
 
+    if predictions is not None:
+        predicted_class_idx = np.argmax(predictions)
+        confidence = predictions[predicted_class_idx] * 100
 
-# -----------------------------
-# Model Comparison Tab Content
-# -----------------------------
-def model_comparison_tab(settings, models):
-    st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-    
-    st.subheader("🔬 Model Comparison Analysis")
-    st.write("Compare the performance of our Custom CNN and Transfer Learning models side by side.")
-    
-    uploaded_file = image_upload_section("comparison")
-    
-    if not uploaded_file:
-        st.info("👆 Upload a coffee bean image to compare model predictions")
-        return
-    
-    image = Image.open(uploaded_file)
-    
-    # Display image
-    st.subheader("📷 Uploaded Image")
-    col_img, col_details = st.columns([2, 1])
-    
-    with col_img:
-        st.image(image, caption="Original Image", use_column_width=True)
-    
-    with col_details:
-        st.write("**Image Details:**")
-        st.write(f"- Size: {image.size[0]} × {image.size[1]} pixels")
-        st.write(f"- Mode: {image.mode}")
-        st.write(f"- Format: {image.format}")
-        
-        if settings["enhance_contrast"]:
-            enhanced = ImageEnhance.Contrast(image).enhance(1.2)
-            st.image(enhanced, caption="Enhanced Image", use_column_width=True)
-    
-    # Auto-detect mapping button
-    st.markdown("---")
-    st.write("🔎 **Mapping Helper**")
-    if st.button("Auto-detect Transfer label mapping (compare Transfer vs Custom for this image)", key="auto_detect_comparison"):
-        if models.get("Custom CNN") is None or models.get("Transfer Learning") is None:
-            st.warning("Both models must be loaded for auto-detect.")
-        else:
-            try:
-                proc_custom = preprocess_image(image, enhance_contrast=settings["enhance_contrast"], model_name="Custom CNN", mode="simple")
-                r_custom = make_enhanced_prediction(
-                    models["Custom CNN"], proc_custom,
-                    softmax_order="good_bad",
-                    sigmoid_positive_good=settings["sigmoid_positive_is_good"],
-                    high_thresh_pct=settings["confidence_threshold_high"]
-                )
-                proc_transfer = preprocess_image(image, enhance_contrast=settings["enhance_contrast"], model_name="Transfer Learning", mode=settings["transfer_preprocess_mode"])
-                r_transfer = make_enhanced_prediction(
-                    models["Transfer Learning"], proc_transfer,
-                    softmax_order=("bad_good" if settings["softmax_label_order"].startswith("bad") else "good_bad"),
-                    sigmoid_positive_good=settings["sigmoid_positive_is_good"],
-                    high_thresh_pct=settings["confidence_threshold_high"]
-                )
-                st.write("Custom model raw:", r_custom["raw_output"], "->", r_custom["prediction"])
-                st.write("Transfer model raw:", r_transfer["raw_output"], "->", r_transfer["prediction"])
+        st.subheader(f"Prediction: {RIPENESS_LABELS[predicted_class_idx]}")
+        st.write(f"Confidence: {confidence:.2f}%")
 
-                # Decide: if they are opposite and both confident, flip suggested
-                conf_custom = max(r_custom["confidence_good"], r_custom["confidence_bad"])
-                conf_transfer = max(r_transfer["confidence_good"], r_transfer["confidence_bad"])
-                if (r_custom["prediction"] in ["Good Bean", "Bad Bean"] and
-                    r_transfer["prediction"] in ["Good Bean", "Bad Bean"] and
-                    r_custom["prediction"] != r_transfer["prediction"] and
-                    conf_custom >= 60 and conf_transfer >= 60):
-                    st.session_state["flip_transfer"] = True
-                    st.success("Auto-detect suggests flipping Transfer model mapping and has been applied.")
-                else:
-                    st.session_state["flip_transfer"] = False
-                    st.info("Auto-detect did not find a confident opposite mapping (no flip applied).")
-            except Exception as e:
-                st.error(f"Auto-detect failed: {e}")
+        # Display all probabilities
+        st.subheader("All Probabilities:")
+        for i, prob in enumerate(predictions):
+            st.write(f"- {RIPENESS_LABELS[i]}: {prob*100:.2f}%")
+    else:
+        st.error("Could not get predictions from the model.")
 
-    st.markdown("---")
-
-    # Model predictions comparison
-    st.subheader("🤖 Model Predictions Comparison")
-    results = {}
-    prediction_cols = st.columns(2)
-
-    soft_order_str = "bad_good" if settings["softmax_label_order"].startswith("bad") else "good_bad"
-    flip_transfer_effective = st.session_state.get("flip_transfer", False) or settings["flip_transfer_manual"]
-
-    for i, (model_name, model) in enumerate(models.items()):
-        with prediction_cols[i]:
-            st.markdown(f"### {model_name}")
-
-            if model is None:
-                st.error(f"❌ {model_name} not available")
-                continue
-
-            chosen_mode = settings["transfer_preprocess_mode"] if model_name == "Transfer Learning" else "simple"
-
-            if model_name == "Transfer Learning" and settings["run_preprocess_diagnostics"]:
-                st.info("Running preprocess diagnostics for Transfer model...")
-                modes = ["resnet50", "tf", "simple"]
-                diag = {}
-                for mode in modes:
-                    try:
-                        proc = preprocess_image(image, enhance_contrast=settings["enhance_contrast"], model_name=model_name, mode=mode)
-                        raw = model.predict(proc, verbose=0)[0]
-                        diag[mode] = np.asarray(raw).tolist()
-                    except Exception as e:
-                        diag[mode] = f"error: {e}"
-                with st.expander("🔬 Preprocess diagnostics"):
-                    st.write(diag)
-
-            try:
-                processed = preprocess_image(image, enhance_contrast=settings["enhance_contrast"], model_name=model_name, mode=chosen_mode)
-            except Exception as e:
-                st.error(f"Preprocessing failed for {model_name}: {e}")
-                continue
-
-            with st.spinner(f"🔄 Analyzing with {model_name}..."):
-                time.sleep(0.3)
-                result = make_enhanced_prediction(
-                    model,
-                    processed,
-                    softmax_order=soft_order_str,
-                    sigmoid_positive_good=settings["sigmoid_positive_is_good"],
-                    high_thresh_pct=settings["confidence_threshold_high"]
-                )
-
-                if "error" in result:
-                    st.error(result["error"])
-                    results[model_name] = None
-                    continue
-
-                # Apply flip only to Transfer model if effective flag set
-                if model_name == "Transfer Learning" and flip_transfer_effective:
-                    result = maybe_flip_result(result)
-
-                results[model_name] = result
-
-                # Show prediction card
-                if result['prediction'] == "Good Bean":
-                    st.markdown(f'<div class="prediction-good">🟢 {result["prediction"]}<br>Confidence: {result["confidence_good"]:.1f}%<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-                elif result['prediction'] == "Bad Bean":
-                    st.markdown(f'<div class="prediction-bad">🔴 {result["prediction"]}<br>Confidence: {result["confidence_bad"]:.1f}%<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="prediction-uncertain">🟡 {result["prediction"]}<br>Certainty: {result["certainty"]}</div>', unsafe_allow_html=True)
-
-                with st.expander("📊 View Detailed Confidence"):
-                    display_confidence_metrics(result, model_name)
-
-                if settings["show_raw_data"]:
-                    with st.expander("🔧 Raw Model Output"):
-                        st.write(result['raw_output'])
-
-    # Comparative analysis
-    valid_results = {k: v for k, v in results.items() if v}
-    if len(valid_results) > 1:
-        st.divider()
-        st.subheader("🔍 Detailed Model Comparison")
-        
-        predictions_list = [r['prediction'] for r in valid_results.values()]
-        if len(set(predictions_list)) == 1:
-            st.success(f"✅ **Model Agreement**: Both models agree — {predictions_list[0]}")
-        else:
-            st.warning("⚠️ **Model Disagreement**: Models have different predictions. Check diagnostics below.")
-
-        # Detailed comparison table
-        comp_cols = st.columns(len(valid_results))
-        for idx, (mname, res) in enumerate(valid_results.items()):
-            with comp_cols[idx]:
-                st.markdown(f"**{mname}**")
-                st.metric("Prediction", res['prediction'])
-                st.metric("Good Confidence", f"{res['confidence_good']:.1f}%")
-                st.metric("Bad Confidence", f"{res['confidence_bad']:.1f}%")
-                st.metric("Certainty", res['certainty'])
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# -----------------------------
-# Main app
-# -----------------------------
-def main():
-    st.markdown('<h1 class="main-header">☕ Coffee Bean Quality Classifier</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Advanced AI-powered coffee bean quality assessment with model comparison</p>', unsafe_allow_html=True)
-
-    # Load models and settings
-    models = load_models()
-    settings = create_sidebar()
-
-    # Create navigation tabs
-    tab1, tab2 = st.tabs(["🏆 Best Model", "🔬 Model Comparison"])
-    
-    with tab1:
-        best_model_tab(settings, models)
-    
-    with tab2:
-        model_comparison_tab(settings, models)
-
-
-if __name__ == "__main__":
-    main()
+st.sidebar.markdown("---")
+st.sidebar.info("This application uses machine learning models to predict ripeness.")
